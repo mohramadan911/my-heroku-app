@@ -57,17 +57,19 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-1
 
-    - name: Get EC2 public IP
-      id: get-ip
+    - name: Get EC2 public IP and private key
+      id: get-ip-and-key
       run: |
         echo "EC2_IP=$(terraform -chdir=./terraform output -raw public_ip)" >> $GITHUB_ENV
+        terraform -chdir=./terraform output -raw private_key > private_key.pem
+        chmod 600 private_key.pem
 
     - name: Deploy to EC2
       uses: appleboy/ssh-action@master
       with:
         host: ${{ env.EC2_IP }}
         username: ec2-user
-        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        key_path: private_key.pem
         script: |
           cd ~/app || mkdir -p ~/app
           rm -rf ~/app/*

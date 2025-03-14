@@ -1,3 +1,20 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 4.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
+    }
+    local = {
+      source  = "hashicorp/local"
+      version = "~> 2.0"
+    }
+  }
+}
+
 provider "aws" {
   region = "us-east-1"  # Choose a region, us-east-1 is a common choice
 }
@@ -83,13 +100,32 @@ resource "aws_security_group" "app_sg" {
   }
 }
 
+# Generate a new key pair
+resource "tls_private_key" "app_key" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+# Create AWS key pair using the public key from the generated key
+resource "aws_key_pair" "app_key_pair" {
+  key_name   = "app-key-pair"
+  public_key = tls_private_key.app_key.public_key_openssh
+}
+
+# Output the private key for secure storage
+resource "local_file" "private_key" {
+  content  = tls_private_key.app_key.private_key_pem
+  filename = "${path.module}/app-key-pair.pem"
+  file_permission = "0600"
+}
+
 # EC2 instance (free tier eligible)
 resource "aws_instance" "app_server" {
   ami                    = "ami-0261755bbcb8c4a84"  # Amazon Linux 2023 AMI - free tier eligible
   instance_type          = "t2.micro"  # Free tier eligible
   subnet_id              = aws_subnet.public_subnet.id
   vpc_security_group_ids = [aws_security_group.app_sg.id]
-  key_name               = "app-key-pair"  # You'll need to create this key pair in AWS
+  key_name               = aws_key_pair.app_key_pair.key_name  # Use the key pair we created
   
   # User data script to install Node.js and set up the application
   user_data = <<-EOF
@@ -112,4 +148,10 @@ resource "aws_instance" "app_server" {
 # Output the public IP for easy access
 output "public_ip" {
   value = aws_instance.app_server.public_ip
+}
+
+# Output the private key for reference
+output "private_key" {
+  value     = tls_private_key.app_key.private_key_pem
+  sensitive = true  # Mark as sensitive to hide it in logs
 }
