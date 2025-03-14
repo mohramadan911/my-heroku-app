@@ -1,105 +1,73 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 4.0"
-    }
-    tls = {
-      source  = "hashicorp/tls"
-      version = "~> 4.0"
-    }
-    local = {
-      source  = "hashicorp/local"
-      version = "~> 2.0"
-    }
-  }
-}
+name: Deploy to AWS EC2
 
-provider "aws" {
-  region = "us-east-1"  # Choose a region, us-east-1 is a common choice
-}
+on:
+  push:
+    branches: [ main ]
 
-# Use the default VPC
-data "aws_vpc" "default" {
-  default = true
-}
+jobs:
+  deploy:
+    name: 'Deploy Infrastructure and Application'
+    runs-on: ubuntu-latest
 
-# Use a default subnet
-data "aws_subnet" "default" {
-  vpc_id            = data.aws_vpc.default.id
-  availability_zone = "us-east-1a"
-  default_for_az    = true
-}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
 
-# No need for internet gateway and route table with default VPC
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.0.0
 
-# Security group in the default VPC
-resource "aws_security_group" "app_sg" {
-  name        = "app-sg"
-  description = "Allow inbound traffic for the app"
-  vpc_id      = data.aws_vpc.default.id
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
 
-  # Allow HTTP
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+    - name: Terraform Init
+      run: terraform init
+      working-directory: ./terraform
 
-  # Allow SSH
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]  # For production, restrict this to your IP
-  }
+    - name: Terraform Apply
+      run: terraform apply -auto-approve
+      working-directory: ./terraform
 
-  # Allow outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+    - name: Get EC2 public IP
+      id: ec2-ip
+      run: |
+        INSTANCE_IP=$(terraform -chdir=./terraform output -raw public_ip)
+        echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+        echo "Found EC2 instance IP: $INSTANCE_IP"
 
-  tags = {
-    Name = "app-sg"
-  }
-}
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
 
-# Use existing key pair
-# No need to create a new one
+    - name: Install dependencies
+      run: npm ci
 
-# EC2 instance (free tier eligible)
-resource "aws_instance" "app_server" {
-  ami                    = "ami-0261755bbcb8c4a84"  # Amazon Linux 2023 AMI - free tier eligible
-  instance_type          = "t2.micro"  # Free tier eligible
-  subnet_id              = data.aws_subnet.default.id
-  vpc_security_group_ids = [aws_security_group.app_sg.id]
-  key_name               = "app-key-pair"  # Use the existing key pair
-  
-  # User data script to install Node.js and set up the application
-  user_data = <<-EOF
-              #!/bin/bash
-              yum update -y
-              yum install -y git
-              curl -sL https://rpm.nodesource.com/setup_18.x | bash -
-              yum install -y nodejs
-              mkdir -p /home/ec2-user/app
-              chown ec2-user:ec2-user /home/ec2-user/app
-              # Install PM2 globally for process management
-              npm install -g pm2
-              EOF
+    # Add a delay to ensure EC2 instance is ready
+    - name: Wait for EC2 instance
+      run: |
+        echo "Waiting 60 seconds for EC2 instance to initialize..."
+        sleep 60
 
-  tags = {
-    Name = "app-server"
-  }
-}
-
-# Output the public IP for easy access
-output "public_ip" {
-  value = aws_instance.app_server.public_ip
-}
-
-# No private key output needed
+    - name: Deploy to EC2
+      uses: appleboy/ssh-action@master
+      with:
+        host: ${{ steps.ec2-ip.outputs.instance_ip }}
+        username: ec2-user
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        script: |
+          cd ~/app || mkdir -p ~/app
+          rm -rf ~/app/*
+          git clone https://github.com/${{ github.repository }}.git ~/app
+          cd ~/app
+          npm install
+          pm2 stop all || true
+          pm2 start app.js --name "nodejs-app"
+          # Set up a simple nginx config to proxy requests to the Node.js app
+          sudo amazon-linux-extras install nginx1 -y
+          ~/app/scripts/setup-nginx.sh
